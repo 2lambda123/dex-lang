@@ -34,7 +34,6 @@ import qualified Unsafe.Coerce as TrulyUnsafe
 import GHC.Generics (Generic (..))
 
 import Builder
-import CheapReduction
 import CheckType
 import Core
 import Err
@@ -42,11 +41,12 @@ import IRVariants
 import MTL1
 import Name
 import Subst
-import QueryType
+import QueryTypePure
 import Types.Core
 import Types.Primitives
 import Types.Source
 import Util
+import Visit
 
 -- === Top-level interface ===
 
@@ -142,13 +142,14 @@ inferTopUDecl (UHandlerDecl _ _ _ _ _ _ _) _ = error "not implemented"
 {-# SCC inferTopUDecl #-}
 
 getInstanceType :: EnvReader m => InstanceDef n -> m n (CorePiType n)
-getInstanceType (InstanceDef className bs params _) = liftEnvReaderM do
-  refreshAbs (Abs bs (ListE params)) \bs' (ListE params') -> do
-    className' <- sinkM className
-    ClassDef classSourceName _ _ _ _ _ <- lookupClassDef className'
-    let dTy = DictTy $ DictType classSourceName className' params'
-    let bs'' = fmapNest (\(RolePiBinder _ b) -> b) bs'
-    return $ CorePiType ImplicitApp bs'' $ EffTy Pure dTy
+getInstanceType = undefined
+-- getInstanceType (InstanceDef className bs params _) = liftEnvReaderM do
+--   refreshAbs (Abs bs (ListE params)) \bs' (ListE params') -> do
+--     className' <- sinkM className
+--     ClassDef classSourceName _ _ _ _ _ <- lookupClassDef className'
+--     let dTy = DictTy $ DictType classSourceName className' params'
+--     let bs'' = fmapNest (\(RolePiBinder _ b) -> b) bs'
+--     return $ CorePiType ImplicitApp bs'' $ EffTy Pure dTy
 
 -- === Inferer interface ===
 
@@ -178,10 +179,10 @@ buildNaryAbsInf
   -> (forall l. (EmitsInf l, DExt n l) => [CAtomVar l] -> m i l (e l))
   -> m i n (Abs (Nest (WithExpl CBinder)) e n)
 buildNaryAbsInf (Abs Empty UnitE) cont = getDistinct >>= \Distinct -> Abs Empty <$> cont []
-buildNaryAbsInf (Abs (Nest (WithExpl expl (b:>ty)) bs) UnitE) cont =
-  prependAbs <$> buildAbsInf (getNameHint b) expl ty \v -> do
-    bs' <- applyRename (b@>atomVarName v) (Abs bs UnitE)
-    buildNaryAbsInf bs' \vs -> cont (sink v:vs)
+-- buildNaryAbsInf (Abs (Nest (WithExpl expl (b:>ty)) bs) UnitE) cont =
+--   prependAbs <$> buildAbsInf (getNameHint b) expl ty \v -> do
+--     bs' <- applyRename (b@>atomVarName v) (Abs bs UnitE)
+--     buildNaryAbsInf bs' \vs -> cont (sink v:vs)
 
 buildDeclsInf
   :: (SubstE AtomSubstVal e, RenameE e, Solver m, InfBuilder m)
@@ -492,28 +493,28 @@ instance InfBuilder (InfererM i) where
         runSubstReaderT (sink env) $ runInfererM' cont
       extendInplaceT =<< hoistThroughDecls frag result
 
-  buildAbsInf hint expl ty cont = do
-    ab <- InfererM $ SubstReaderT $ ReaderT \env -> do
-      extendInplaceT =<< withFreshBinder hint ty \bWithTy@(b:>_) -> do
-        ab <- locallyMutableInplaceT do
-          v <- sinkM $ binderVar bWithTy
-          extendInplaceTLocal (extendSynthCandidatesInf expl $ atomVarName v) do
-            EmitsInf <- fabricateEmitsInfEvidenceM
-            -- zonking is needed so that dceInfFrag works properly
-            runSubstReaderT (sink env) (runInfererM' $ cont v >>= zonk)
-        ab' <- dceInfFrag ab
-        refreshAbs ab' \infFrag result -> do
-          case exchangeBs $ PairB b infFrag of
-            HoistSuccess (PairB infFrag' b') -> do
-              return $ withSubscopeDistinct b' $
-                Abs infFrag' $ Abs b' result
-            HoistFailure vs -> do
-              throw EscapedNameErr $ (pprint vs)
-                ++ "\nFailed to exchange binders in buildAbsInf"
-                ++ "\n" ++ pprint infFrag
-    Abs b e <- return ab
-    ty' <- zonk ty
-    return $ Abs (WithExpl expl (b:>ty')) e
+  buildAbsInf hint expl ty cont = undefined
+    -- ab <- InfererM $ SubstReaderT $ ReaderT \env -> do
+    --   extendInplaceT =<< withFreshBinder hint ty \bWithTy@(b:>_) -> do
+    --     ab <- locallyMutableInplaceT do
+    --       v <- sinkM $ binderVar bWithTy
+    --       extendInplaceTLocal (extendSynthCandidatesInf expl $ atomVarName v) do
+    --         EmitsInf <- fabricateEmitsInfEvidenceM
+    --         -- zonking is needed so that dceInfFrag works properly
+    --         runSubstReaderT (sink env) (runInfererM' $ cont v >>= zonk)
+    --     ab' <- dceInfFrag ab
+    --     refreshAbs ab' \infFrag result -> do
+    --       case exchangeBs $ PairB b infFrag of
+    --         HoistSuccess (PairB infFrag' b') -> do
+    --           return $ withSubscopeDistinct b' $
+    --             Abs infFrag' $ Abs b' result
+    --         HoistFailure vs -> do
+    --           throw EscapedNameErr $ (pprint vs)
+    --             ++ "\nFailed to exchange binders in buildAbsInf"
+    --             ++ "\n" ++ pprint infFrag
+    -- Abs b e <- return ab
+    -- ty' <- zonk ty
+    -- return $ Abs (WithExpl expl (b:>ty')) e
 
 dceInfFrag
   :: (EnvReader m, EnvExtender m, Fallible1 m, RenameE e, HoistableE e)
@@ -838,29 +839,30 @@ data RequiredTy (e::E) (n::S) =
 
 checkSigma :: EmitsBoth o
            => NameHint -> UExpr i -> CType o -> InfererM i o (CAtom o)
-checkSigma hint expr sTy = confuseGHC >>= \_ -> case sTy of
-  Pi piTy@(CorePiType _ bs _) -> do
-    if all (== Explicit) (nestToList getExpl bs)
-      then fallback
-      else case expr of
-        WithSrcE src (ULam lam) -> addSrcContext src $ Lam <$> checkULam lam piTy
-        _ -> Lam <$> buildLamInf piTy \args resultTy -> do
-          explicits <- return $ catMaybes $ args <&> \case
-            (Explicit, arg) -> Just arg
-            _ -> Nothing
-          expr' <- inferWithoutInstantiation expr >>= zonk
-          dropSubst $ checkOrInferApp expr' explicits [] (Check resultTy)
-  DepPairTy depPairTy -> case depPairTy of
-    DepPairType ImplicitDepPair (_ :> lhsTy) _ -> do
-      -- TODO: check for the case that we're given some of the implicit dependent pair args explicitly
-      lhsVal <- Var <$> freshInferenceName MiscInfVar lhsTy
-      -- TODO: make an InfVarDesc case for dep pair instantiation
-      rhsTy <- instantiateDepPairTy depPairTy lhsVal
-      rhsVal <- checkSigma noHint expr rhsTy
-      return $ DepPair lhsVal rhsVal depPairTy
-    _ -> fallback
-  _ -> fallback
-  where fallback = checkOrInferRho hint expr (Check sTy)
+checkSigma = undefined
+-- checkSigma hint expr sTy = confuseGHC >>= \_ -> case sTy of
+--   Pi piTy@(CorePiType _ bs _) -> do
+--     if all (== Explicit) (nestToList getExpl bs)
+--       then fallback
+--       else case expr of
+--         WithSrcE src (ULam lam) -> addSrcContext src $ Lam <$> checkULam lam piTy
+--         _ -> Lam <$> buildLamInf piTy \args resultTy -> do
+--           explicits <- return $ catMaybes $ args <&> \case
+--             (Explicit, arg) -> Just arg
+--             _ -> Nothing
+--           expr' <- inferWithoutInstantiation expr >>= zonk
+--           dropSubst $ checkOrInferApp expr' explicits [] (Check resultTy)
+--   DepPairTy depPairTy -> case depPairTy of
+--     DepPairType ImplicitDepPair (_ :> lhsTy) _ -> do
+--       -- TODO: check for the case that we're given some of the implicit dependent pair args explicitly
+--       lhsVal <- Var <$> freshInferenceName MiscInfVar lhsTy
+--       -- TODO: make an InfVarDesc case for dep pair instantiation
+--       rhsTy <- instantiateDepPairTy depPairTy lhsVal
+--       rhsVal <- checkSigma noHint expr rhsTy
+--       return $ DepPair lhsVal rhsVal depPairTy
+--     _ -> fallback
+--   _ -> fallback
+--   where fallback = checkOrInferRho hint expr (Check sTy)
 
 inferSigma :: EmitsBoth o => NameHint -> UExpr i -> InfererM i o (CAtom o)
 inferSigma hint (WithSrcE pos expr) = case expr of
@@ -917,30 +919,30 @@ checkOrInferRho hint uExprWithSrc@(WithSrcE pos expr) reqTy = do
  addSrcContext pos $ confuseGHC >>= \_ -> case expr of
   UVar _ -> inferAndInstantiate
   ULit l -> matchRequirement $ Con $ Lit l
-  ULam lamExpr -> do
-    case reqTy of
-      Check (Pi piTy) -> Lam <$> checkULam lamExpr piTy
-      Check _ -> Lam <$> inferULam lamExpr >>= matchRequirement
-      Infer   -> Lam <$> inferULam lamExpr
-  UFor dir uFor -> do
-    lam@(UnaryLamExpr b' _) <- case reqTy of
-      Check (TabPi tabPiTy) -> do checkUForExpr uFor tabPiTy
-      Check _ -> inferUForExpr uFor
-      Infer   -> inferUForExpr uFor
-    ixTy <- asIxType $ binderType b'
-    result <- emitHof $ For dir ixTy lam
-    matchRequirement result
+  -- ULam lamExpr -> do
+  --   case reqTy of
+  --     Check (Pi piTy) -> Lam <$> checkULam lamExpr piTy
+  --     Check _ -> Lam <$> inferULam lamExpr >>= matchRequirement
+  --     Infer   -> Lam <$> inferULam lamExpr
+  -- UFor dir uFor -> do
+  --   lam@(UnaryLamExpr b' _) <- case reqTy of
+  --     Check (TabPi tabPiTy) -> do checkUForExpr uFor tabPiTy
+  --     Check _ -> inferUForExpr uFor
+  --     Infer   -> inferUForExpr uFor
+  --   ixTy <- asIxType $ binderType b'
+  --   result <- emitHof $ For dir ixTy lam
+  --   matchRequirement result
   UApp f posArgs namedArgs -> do
     f' <- inferWithoutInstantiation f >>= zonk
     checkOrInferApp f' posArgs namedArgs reqTy
   UTabApp tab args -> do
     tab' <- inferRho noHint tab >>= zonk
     inferTabApp (srcPos tab) tab' args >>= matchRequirement
-  UPi (UPiExpr bs appExpl effs ty) -> do
-    -- TODO: check explicitness constraints
-    ab <- withUBinders bs \_ -> EffTy <$> checkUEffRow effs <*> checkUType ty
-    Abs bs' effTy' <- return ab
-    matchRequirement $ Type $ Pi $ CorePiType appExpl bs' effTy'
+  -- UPi (UPiExpr bs appExpl effs ty) -> do
+  --   -- TODO: check explicitness constraints
+  --   ab <- withUBinders bs \_ -> EffTy <$> checkUEffRow effs <*> checkUType ty
+  --   Abs bs' effTy' <- return ab
+  --   matchRequirement $ Type $ Pi $ CorePiType appExpl bs' effTy'
   UTabPi (UTabPiExpr (UAnnBinder b ann cs) ty) -> do
     unless (null cs) $ throw TypeErr "`=>` shouldn't have constraints"
     ann' <- asIxType =<< checkAnn (getSourceName b) ann
@@ -959,14 +961,14 @@ checkOrInferRho hint uExprWithSrc@(WithSrcE pos expr) reqTy = do
       buildDepPairTyInf (getNameHint b) expl ann' \v -> extendRenamer (b@>atomVarName v) do
         let msg =  "Can't reduce type expression: " ++ docAsStr (pretty rhs)
         withReducibleEmissions msg $ checkUType rhs
-  UDepPair lhs rhs -> do
-    case reqTy of
-      Check (DepPairTy ty@(DepPairType _ (_ :> lhsTy) _)) -> do
-        lhs' <- checkSigmaDependent noHint lhs lhsTy
-        rhsTy <- instantiateDepPairTy ty lhs'
-        rhs' <- checkSigma noHint rhs rhsTy
-        return $ DepPair lhs' rhs' ty
-      _ -> throw TypeErr $ "Can't infer the type of a dependent pair; please annotate it"
+  -- UDepPair lhs rhs -> do
+  --   case reqTy of
+  --     Check (DepPairTy ty@(DepPairType _ (_ :> lhsTy) _)) -> do
+  --       lhs' <- checkSigmaDependent noHint lhs lhsTy
+  --       rhsTy <- instantiateDepPairTy ty lhs'
+  --       rhs' <- checkSigma noHint rhs rhsTy
+  --       return $ DepPair lhs' rhs' ty
+  --     _ -> throw TypeErr $ "Can't infer the type of a dependent pair; please annotate it"
   UCase scrut alts -> do
     scrut' <- inferRho noHint scrut
     scrutTy <- return $ getType scrut'
@@ -1121,56 +1123,58 @@ data FieldDef (n::S) =
    deriving (Show, Generic)
 
 getFieldDefs :: CType n -> InfererM i n (M.Map FieldName' (FieldDef n))
-getFieldDefs ty = case ty of
-  NewtypeTyCon (UserADTType _ tyName params) -> do
-    TyConBinding ~(Just tyDef) (DotMethods dotMethods) <- lookupEnv tyName
-    instantiateTyConDef tyDef params >>= \case
-      StructFields fields -> do
-        let projFields = enumerate fields <&> \(i, (field, _)) ->
-              [(FieldName field, FieldProj i), (FieldNum i, FieldProj i)]
-        let methodFields = M.toList dotMethods <&> \(field, f) ->
-              (FieldName field, FieldDotMethod f params)
-        return $ M.fromList $ concat projFields ++ methodFields
-      ADTCons _ -> noFields ""
-  RefTy _ valTy -> case valTy of
-    RefTy _ _ -> noFields ""
-    _ -> do
-      valFields <- getFieldDefs valTy
-      return $ M.filter isProj valFields
-      where isProj = \case
-              FieldProj _ -> True
-              _ -> False
-  ProdTy ts -> return $ M.fromList $ enumerate ts <&> \(i, _) -> (FieldNum i, FieldProj i)
-  TabPi _ -> noFields "\nArray indexing uses [] now."
-  _ -> noFields ""
-  where
-    noFields s = throw TypeErr $ "Can't get fields for type " ++ pprint ty ++ s
+getFieldDefs = undefined
+-- getFieldDefs ty = case ty of
+--   NewtypeTyCon (UserADTType _ tyName params) -> do
+--     TyConBinding ~(Just tyDef) (DotMethods dotMethods) <- lookupEnv tyName
+--     instantiateTyConDef tyDef params >>= \case
+--       StructFields fields -> do
+--         let projFields = enumerate fields <&> \(i, (field, _)) ->
+--               [(FieldName field, FieldProj i), (FieldNum i, FieldProj i)]
+--         let methodFields = M.toList dotMethods <&> \(field, f) ->
+--               (FieldName field, FieldDotMethod f params)
+--         return $ M.fromList $ concat projFields ++ methodFields
+--       ADTCons _ -> noFields ""
+--   RefTy _ valTy -> case valTy of
+--     RefTy _ _ -> noFields ""
+--     _ -> do
+--       valFields <- getFieldDefs valTy
+--       return $ M.filter isProj valFields
+--       where isProj = \case
+--               FieldProj _ -> True
+--               _ -> False
+--   ProdTy ts -> return $ M.fromList $ enumerate ts <&> \(i, _) -> (FieldNum i, FieldProj i)
+--   TabPi _ -> noFields "\nArray indexing uses [] now."
+--   _ -> noFields ""
+--   where
+--     noFields s = throw TypeErr $ "Can't get fields for type " ++ pprint ty ++ s
 
 instantiateSigma :: forall i o. EmitsBoth o => SigmaAtom o -> InfererM i o (CAtom o)
-instantiateSigma sigmaAtom = case getType sigmaAtom of
-  Pi piTy@(CorePiType ExplicitApp _ _) -> do
-    Lam <$> etaExpandExplicits fDesc piTy \args ->
-      applySigmaAtom (sink sigmaAtom) args
-  Pi (CorePiType ImplicitApp bs (EffTy _ resultTy)) -> do
-    args <- inferMixedArgs @UExpr fDesc (Abs bs resultTy) [] []
-    applySigmaAtom sigmaAtom args
-  DepPairTy (DepPairType ImplicitDepPair _ _) ->
-    -- TODO: we should probably call instantiateSigma again here in case
-    -- we have nested dependent pairs. Also, it looks like this doesn't
-    -- get called after function application. We probably want to fix that.
-    fallback >>= getSnd
-  _ -> fallback
-  where
-   fallback = case sigmaAtom of
-     SigmaAtom _ x -> return x
-     SigmaUVar _ _ v -> case v of
-       UAtomVar v' -> do
-         v'' <- toAtomVar v'
-         return $ Var v''
-       _ -> applySigmaAtom sigmaAtom []
-     SigmaPartialApp _ _ _ -> error "shouldn't hit this case because we should have a pi type here"
-   fDesc :: SourceName
-   fDesc = getSourceName sigmaAtom
+instantiateSigma = undefined
+-- instantiateSigma sigmaAtom = case getType sigmaAtom of
+--   Pi piTy@(CorePiType ExplicitApp _ _) -> do
+--     Lam <$> etaExpandExplicits fDesc piTy \args ->
+--       applySigmaAtom (sink sigmaAtom) args
+--   Pi (CorePiType ImplicitApp bs (EffTy _ resultTy)) -> do
+--     args <- inferMixedArgs @UExpr fDesc (Abs bs resultTy) [] []
+--     applySigmaAtom sigmaAtom args
+--   DepPairTy (DepPairType ImplicitDepPair _ _) ->
+--     -- TODO: we should probably call instantiateSigma again here in case
+--     -- we have nested dependent pairs. Also, it looks like this doesn't
+--     -- get called after function application. We probably want to fix that.
+--     fallback >>= getSnd
+--   _ -> fallback
+--   where
+--    fallback = case sigmaAtom of
+--      SigmaAtom _ x -> return x
+--      SigmaUVar _ _ v -> case v of
+--        UAtomVar v' -> do
+--          v'' <- toAtomVar v'
+--          return $ Var v''
+--        _ -> applySigmaAtom sigmaAtom []
+--      SigmaPartialApp _ _ _ -> error "shouldn't hit this case because we should have a pi type here"
+--    fDesc :: SourceName
+--    fDesc = getSourceName sigmaAtom
 
 projectField :: Emits o => Int -> CAtom o -> InfererM i o (CAtom o)
 projectField i x = case getType x of
@@ -1189,53 +1193,55 @@ etaExpandExplicits
   :: EmitsInf o => SourceName -> CorePiType o
   -> (forall o'. (EmitsBoth o', DExt o o') => [CAtom o'] -> InfererM i o' (CAtom o'))
   -> InfererM i o (CoreLamExpr o)
-etaExpandExplicits fSourceName (CorePiType _ bsTop (EffTy effs _)) contTop = do
-  ab <- go bsTop \xs -> do
-    effs' <- applySubst (bsTop@@>(SubstVal<$>xs)) effs
-    withAllowedEffects effs' do
-      body <- buildBlockInf $ contTop $ sinkList xs
-      return $ PairE effs' body
-  coreLamExpr ExplicitApp ab
- where
-  go :: (EmitsInf o, SinkableE e, RenameE e, SubstE AtomSubstVal e, HoistableE e )
-     => Nest (WithExpl CBinder) o any
-     -> (forall o'. (EmitsInf o', DExt o o') => [CAtom o'] -> InfererM i o' (e o'))
-     -> InfererM i o (Abs (Nest (WithExpl CBinder)) e o)
-  go Empty cont = getDistinct >>= \Distinct -> Abs Empty <$> cont []
-  go (Nest (WithExpl expl (b:>ty)) rest) cont = case expl of
-    Explicit -> do
-      prependAbs <$> buildAbsInf (getNameHint b) expl ty \v -> do
-        Abs rest' UnitE <- applyRename (b@>atomVarName v) $ Abs rest UnitE
-        go rest' \args -> cont (sink (Var v) : args)
-    Inferred argSourceName infMech -> do
-      arg <- getImplicitArg (fSourceName, fromMaybe "_" argSourceName) infMech ty
-      Abs rest' UnitE <- applySubst (b@>SubstVal arg) $ Abs rest UnitE
-      go rest' \args -> cont (sink arg : args)
+etaExpandExplicits _ _ _ = undefined
+-- etaExpandExplicits fSourceName (CorePiType _ bsTop (EffTy effs _)) contTop = do
+--   ab <- go bsTop \xs -> do
+--     effs' <- applySubst (bsTop@@>(SubstVal<$>xs)) effs
+--     withAllowedEffects effs' do
+--       body <- buildBlockInf $ contTop $ sinkList xs
+--       return $ PairE effs' body
+--   coreLamExpr ExplicitApp ab
+--  where
+--   go :: (EmitsInf o, SinkableE e, RenameE e, SubstE AtomSubstVal e, HoistableE e )
+--      => Nest (WithExpl CBinder) o any
+--      -> (forall o'. (EmitsInf o', DExt o o') => [CAtom o'] -> InfererM i o' (e o'))
+--      -> InfererM i o (Abs (Nest (WithExpl CBinder)) e o)
+--   go Empty cont = getDistinct >>= \Distinct -> Abs Empty <$> cont []
+--   go (Nest (WithExpl expl (b:>ty)) rest) cont = case expl of
+--     Explicit -> do
+--       prependAbs <$> buildAbsInf (getNameHint b) expl ty \v -> do
+--         Abs rest' UnitE <- applyRename (b@>atomVarName v) $ Abs rest UnitE
+--         go rest' \args -> cont (sink (Var v) : args)
+--     Inferred argSourceName infMech -> do
+--       arg <- getImplicitArg (fSourceName, fromMaybe "_" argSourceName) infMech ty
+--       Abs rest' UnitE <- applySubst (b@>SubstVal arg) $ Abs rest UnitE
+--       go rest' \args -> cont (sink arg : args)
 
 buildLamInf
   :: EmitsInf o => CorePiType o
   -> (forall o' .  (EmitsBoth o', DExt o o')
                 => [(Explicitness, CAtom o')] -> CType o' -> InfererM i o' (CAtom o'))
   -> InfererM i o (CoreLamExpr o)
-buildLamInf (CorePiType appExpl bsTop effTy) contTop = do
-  ab <- go bsTop \xs -> do
-    let (expls, xs') = unzip xs
-    EffTy effs' resultTy' <- applySubst (bsTop@@>(SubstVal<$>xs')) effTy
-    withAllowedEffects effs' do
-      body <- buildBlockInf $ contTop (zip expls $ sinkList xs') (sink resultTy')
-      return $ PairE effs' body
-  coreLamExpr appExpl ab
- where
-  go :: (EmitsInf o, HoistableE e, SinkableE e, SubstE AtomSubstVal e, RenameE e)
-     => Nest (WithExpl CBinder) o any
-     -> (forall o'. (EmitsInf o', DExt o o')
-           => [(Explicitness, CAtom o')] -> InfererM i o' (e o'))
-     -> InfererM i o (Abs (Nest (WithExpl CBinder)) e o)
-  go Empty cont = getDistinct >>= \Distinct -> Abs Empty <$> cont []
-  go (Nest (WithExpl expl b) rest) cont = do
-    prependAbs <$> buildAbsInf (getNameHint b) expl (binderType b) \v -> do
-      Abs rest' UnitE <- applyRename (b@>atomVarName v) $ Abs rest UnitE
-      go rest' \args -> cont ((expl, sink (Var v)) : args)
+buildLamInf _ _ = undefined
+-- buildLamInf (CorePiType appExpl bsTop effTy) contTop = do
+--   ab <- go bsTop \xs -> do
+--     let (expls, xs') = unzip xs
+--     EffTy effs' resultTy' <- applySubst (bsTop@@>(SubstVal<$>xs')) effTy
+--     withAllowedEffects effs' do
+--       body <- buildBlockInf $ contTop (zip expls $ sinkList xs') (sink resultTy')
+--       return $ PairE effs' body
+--   coreLamExpr appExpl ab
+--  where
+--   go :: (EmitsInf o, HoistableE e, SinkableE e, SubstE AtomSubstVal e, RenameE e)
+--      => Nest (WithExpl CBinder) o any
+--      -> (forall o'. (EmitsInf o', DExt o o')
+--            => [(Explicitness, CAtom o')] -> InfererM i o' (e o'))
+--      -> InfererM i o (Abs (Nest (WithExpl CBinder)) e o)
+--   go Empty cont = getDistinct >>= \Distinct -> Abs Empty <$> cont []
+--   go (Nest (WithExpl expl b) rest) cont = do
+--     prependAbs <$> buildAbsInf (getNameHint b) expl (binderType b) \v -> do
+--       Abs rest' UnitE <- applyRename (b@>atomVarName v) $ Abs rest UnitE
+--       go rest' \args -> cont ((expl, sink (Var v)) : args)
 
 class ExplicitArg (e::E) where
   checkExplicitArg :: EmitsBoth o => IsDependent -> e i -> CType o -> InfererM i o (CAtom o)
@@ -1313,38 +1319,39 @@ maybeInterpretPunsAsTyCons _ x = return x
 type IsDependent = Bool
 
 applySigmaAtom :: EmitsBoth o => SigmaAtom o -> [CAtom o] -> InfererM i o (CAtom o)
-applySigmaAtom (SigmaAtom _ f) args = emitExprWithEffects =<< mkApp f args
-applySigmaAtom (SigmaUVar _ _ f) args = case f of
-  UAtomVar f' -> do
-    f'' <- toAtomVar f'
-    emitExprWithEffects =<< mkApp (Var f'') args
-  UTyConVar f' -> do
-    TyConDef sn bs _ <- lookupTyCon f'
-    let expls = nestToList (\(RolePiBinder _ (WithExpl expl _)) -> expl) bs
-    return $ Type $ NewtypeTyCon $ UserADTType sn f' (TyConParams expls args)
-  UDataConVar v -> do
-    (tyCon, i) <- lookupDataCon v
-    applyDataCon tyCon i args
-  UPunVar tc -> do
-    TyConDef sn _ _ <- lookupTyCon tc
-    -- interpret as a data constructor by default
-    (params, dataArgs) <- splitParamPrefix tc args
-    repVal <- makeStructRepVal tc dataArgs
-    return $ NewtypeCon (UserADTData sn tc params) repVal
-  UClassVar   f' -> do
-    ClassDef sourceName _ _ _ _ _ <- lookupClassDef f'
-    return $ Type $ DictTy $ DictType sourceName f' args
-  UMethodVar  f' -> do
-    MethodBinding className methodIdx <- lookupEnv f'
-    ClassDef _ _ _ paramBs _ _ <- lookupClassDef className
-    let numParams = nestLength paramBs
-    -- params aren't needed because they're already implied by the dict argument
-    let (dictArg:args') = drop numParams args
-    emitExprWithEffects =<< mkApplyMethod dictArg methodIdx args'
-  UEffectVar   _ -> error "not implemented"
-  UEffectOpVar _ -> error "not implemented"
-applySigmaAtom (SigmaPartialApp _ f prevArgs) args =
-  emitExprWithEffects =<< mkApp f (prevArgs ++ args)
+applySigmaAtom = undefined
+-- applySigmaAtom (SigmaAtom _ f) args = emitExprWithEffects =<< mkApp f args
+-- applySigmaAtom (SigmaUVar _ _ f) args = case f of
+--   UAtomVar f' -> do
+--     f'' <- toAtomVar f'
+--     emitExprWithEffects =<< mkApp (Var f'') args
+--   UTyConVar f' -> do
+--     TyConDef sn bs _ <- lookupTyCon f'
+--     let expls = nestToList (\(RolePiBinder _ (WithExpl expl _)) -> expl) bs
+--     return $ Type $ NewtypeTyCon $ UserADTType sn f' (TyConParams expls args)
+--   UDataConVar v -> do
+--     (tyCon, i) <- lookupDataCon v
+--     applyDataCon tyCon i args
+--   UPunVar tc -> do
+--     TyConDef sn _ _ <- lookupTyCon tc
+--     -- interpret as a data constructor by default
+--     (params, dataArgs) <- splitParamPrefix tc args
+--     repVal <- makeStructRepVal tc dataArgs
+--     return $ NewtypeCon (UserADTData sn tc params) repVal
+--   UClassVar   f' -> do
+--     ClassDef sourceName _ _ _ _ _ <- lookupClassDef f'
+--     return $ Type $ DictTy $ DictType sourceName f' args
+--   UMethodVar  f' -> do
+--     MethodBinding className methodIdx <- lookupEnv f'
+--     ClassDef _ _ _ paramBs _ _ <- lookupClassDef className
+--     let numParams = nestLength paramBs
+--     -- params aren't needed because they're already implied by the dict argument
+--     let (dictArg:args') = drop numParams args
+--     emitExprWithEffects =<< mkApplyMethod dictArg methodIdx args'
+--   UEffectVar   _ -> error "not implemented"
+--   UEffectOpVar _ -> error "not implemented"
+-- applySigmaAtom (SigmaPartialApp _ f prevArgs) args =
+--   emitExprWithEffects =<< mkApp f (prevArgs ++ args)
 
 splitParamPrefix :: EnvReader m => TyConName n -> [CAtom n] -> m n (TyConParams n, [CAtom n])
 splitParamPrefix tc args = do
@@ -1354,35 +1361,36 @@ splitParamPrefix tc args = do
   return (params, dataArgs)
 
 applyDataCon :: Emits o => TyConName o -> Int -> [CAtom o] -> InfererM i o (CAtom o)
-applyDataCon tc conIx topArgs = do
-  tyDef@(TyConDef sn _ _) <- lookupTyCon tc
-  (params, dataArgs) <- splitParamPrefix tc topArgs
-  ADTCons conDefs <- instantiateTyConDef tyDef params
-  DataConDef _ _ repTy _ <- return $ conDefs !! conIx
-  conProd <- wrap repTy dataArgs
-  repVal <- return case conDefs of
-    []  -> error "unreachable"
-    [_] -> conProd
-    _   -> SumVal conTys conIx conProd
-      where conTys = conDefs <&> \(DataConDef _ _ rty _) -> rty
-  return $ NewtypeCon (UserADTData sn tc params) repVal
-  where
-    wrap :: EnvReader m => CType n -> [CAtom n] -> m n (CAtom n)
-    wrap _ [arg] = return $ arg
-    wrap rty args = case rty of
-      ProdTy tys  ->
-        if nargs == ntys
-          then return $ ProdVal args
-          else ProdVal . (curArgs ++) . (:[]) <$> wrap (last tys) remArgs
-        where
-          nargs = length args; ntys = length tys
-          (curArgs, remArgs) = splitAt (ntys - 1) args
-      DepPairTy dpt@(DepPairType _ b rty') -> do
-        rty'' <- applySubst (b@>SubstVal h) rty'
-        ans <- wrap rty'' t
-        return $ DepPair h ans dpt
-        where h:t = args
-      _ -> error $ "Unexpected data con representation type: " ++ pprint rty
+applyDataCon = undefined
+-- applyDataCon tc conIx topArgs = do
+--   tyDef@(TyConDef sn _ _) <- lookupTyCon tc
+--   (params, dataArgs) <- splitParamPrefix tc topArgs
+--   ADTCons conDefs <- instantiateTyConDef tyDef params
+--   DataConDef _ _ repTy _ <- return $ conDefs !! conIx
+--   conProd <- wrap repTy dataArgs
+--   repVal <- return case conDefs of
+--     []  -> error "unreachable"
+--     [_] -> conProd
+--     _   -> SumVal conTys conIx conProd
+--       where conTys = conDefs <&> \(DataConDef _ _ rty _) -> rty
+--   return $ NewtypeCon (UserADTData sn tc params) repVal
+--   where
+--     wrap :: EnvReader m => CType n -> [CAtom n] -> m n (CAtom n)
+--     wrap _ [arg] = return $ arg
+--     wrap rty args = case rty of
+--       ProdTy tys  ->
+--         if nargs == ntys
+--           then return $ ProdVal args
+--           else ProdVal . (curArgs ++) . (:[]) <$> wrap (last tys) remArgs
+--         where
+--           nargs = length args; ntys = length tys
+--           (curArgs, remArgs) = splitAt (ntys - 1) args
+--       DepPairTy dpt@(DepPairType _ b rty') -> do
+--         rty'' <- applySubst (b@>SubstVal h) rty'
+--         ans <- wrap rty'' t
+--         return $ DepPair h ans dpt
+--         where h:t = args
+--       _ -> error $ "Unexpected data con representation type: " ++ pprint rty
 
 emitExprWithEffects :: EmitsBoth o => CExpr o -> InfererM i o (CAtom o)
 emitExprWithEffects expr = do
@@ -1404,37 +1412,38 @@ inferMixedArgs
   => SourceName
   -> Abs (Nest (WithExpl CBinder)) e o -> [arg i] -> [(SourceName, arg i)]
   -> InfererM i o [CAtom o]
-inferMixedArgs fSourceName bsAbs posArgs namedArgs = do
-  checkNamedArgValidity bsAbs (map fst namedArgs)
-  liftM fst $ runStreamReaderT1 posArgs $ go bsAbs
- where
-  go :: (EmitsBoth o, SubstE (SubstVal Atom) e, SinkableE e, HoistableE e)
-     => Abs (Nest (WithExpl CBinder)) e o
-    -> StreamReaderT1 (arg i) (InfererM i) o [CAtom o]
-  go (Abs Empty _) = return []
-  go (Abs (Nest (WithExpl expl b) bs) result) = do
-    let rest = Abs bs result
-    let isDependent = binderName b `isFreeIn` rest
-    arg <- inferMixedArg isDependent (binderType b) expl
-    arg' <- lift11 $ zonk arg
-    rest' <- applySubst (b @> SubstVal arg') rest
-    (arg:) <$> go rest'
+inferMixedArgs _ _ _ _ = undefined
+-- inferMixedArgs fSourceName bsAbs posArgs namedArgs = do
+--   checkNamedArgValidity bsAbs (map fst namedArgs)
+--   liftM fst $ runStreamReaderT1 posArgs $ go bsAbs
+--  where
+--   go :: (EmitsBoth o, SubstE (SubstVal Atom) e, SinkableE e, HoistableE e)
+--      => Abs (Nest (WithExpl CBinder)) e o
+--     -> StreamReaderT1 (arg i) (InfererM i) o [CAtom o]
+--   go (Abs Empty _) = return []
+--   go (Abs (Nest (WithExpl expl b) bs) result) = do
+--     let rest = Abs bs result
+--     let isDependent = binderName b `isFreeIn` rest
+--     arg <- inferMixedArg isDependent (binderType b) expl
+--     arg' <- lift11 $ zonk arg
+--     rest' <- applySubst (b @> SubstVal arg') rest
+--     (arg:) <$> go rest'
 
-  inferMixedArg :: EmitsBoth o => IsDependent -> CType o -> Explicitness
-                -> StreamReaderT1 (arg i) (InfererM i) o (CAtom o)
-  inferMixedArg isDependent argTy = \case
-    Explicit -> do
-      -- this should succeed because we've already done the arity check
-      Just arg <- readStream
-      lift11 $ checkExplicitArg isDependent arg argTy
-    Inferred argName infMech -> lift11 do
-      case lookupNamedArg argName of
-        Nothing -> getImplicitArg (fSourceName, fromMaybe "_" argName) infMech argTy
-        Just arg -> checkExplicitArg isDependent arg argTy
+--   inferMixedArg :: EmitsBoth o => IsDependent -> CType o -> Explicitness
+--                 -> StreamReaderT1 (arg i) (InfererM i) o (CAtom o)
+--   inferMixedArg isDependent argTy = \case
+--     Explicit -> do
+--       -- this should succeed because we've already done the arity check
+--       Just arg <- readStream
+--       lift11 $ checkExplicitArg isDependent arg argTy
+--     Inferred argName infMech -> lift11 do
+--       case lookupNamedArg argName of
+--         Nothing -> getImplicitArg (fSourceName, fromMaybe "_" argName) infMech argTy
+--         Just arg -> checkExplicitArg isDependent arg argTy
 
-  lookupNamedArg :: Maybe SourceName -> Maybe (arg i)
-  lookupNamedArg Nothing = Nothing
-  lookupNamedArg (Just v) = lookup v namedArgs
+--   lookupNamedArg :: Maybe SourceName -> Maybe (arg i)
+--   lookupNamedArg Nothing = Nothing
+--   lookupNamedArg (Just v) = lookup v namedArgs
 
 checkNamedArgValidity :: (BindsNames b, Fallible m) => Abs (Nest (WithExpl b)) e any -> [SourceName] -> m ()
 checkNamedArgValidity (Abs bs _) offeredNames = do
@@ -1451,13 +1460,14 @@ checkNamedArgValidity (Abs bs _) offeredNames = do
       ++ "\nShould be one of: " ++ pprint acceptedNames
 
 inferPrimArg :: EmitsBoth o => UExpr i -> InfererM i o (CAtom o)
-inferPrimArg x = do
-  xBlock <- buildBlockInf $ inferRho noHint x
-  case getType xBlock of
-    TyKind -> cheapReduce xBlock >>= \case
-      Just reduced -> return reduced
-      _ -> throw CompilerErr "Type args to primops must be reducible"
-    _ -> emitBlock xBlock
+inferPrimArg = undefined
+-- inferPrimArg x = do
+--   xBlock <- buildBlockInf $ inferRho noHint x
+--   case getType xBlock of
+--     TyKind -> cheapReduce xBlock >>= \case
+--       Just reduced -> return reduced
+--       _ -> throw CompilerErr "Type args to primops must be reducible"
+--     _ -> emitBlock xBlock
 
 matchPrimApp :: Emits o => PrimName -> [CAtom o] -> InfererM i o (CAtom o)
 matchPrimApp = \case
@@ -1532,18 +1542,19 @@ inferTabApp tabCtx tab args = addSrcContext tabCtx do
 inferNaryTabAppArgs
   :: EmitsBoth o
   => CType o -> [UExpr i] -> InfererM i o [CAtom o]
-inferNaryTabAppArgs _ [] = return []
-inferNaryTabAppArgs tabTy (arg:rest) = do
-  TabPiType _ b resultTy <- fromTabPiType True tabTy
-  let ixTy = binderType b
-  let isDependent = binderName b `isFreeIn` resultTy
-  arg' <- if isDependent
-    then checkSigmaDependent (getNameHint b) arg ixTy
-    else checkSigma (getNameHint b) arg ixTy
-  arg'' <- zonk arg'
-  resultTy' <- applySubst (b @> SubstVal arg'') resultTy
-  rest' <- inferNaryTabAppArgs resultTy' rest
-  return $ arg'':rest'
+inferNaryTabAppArgs = undefined
+-- inferNaryTabAppArgs _ [] = return []
+-- inferNaryTabAppArgs tabTy (arg:rest) = do
+--   TabPiType _ b resultTy <- fromTabPiType True tabTy
+--   let ixTy = binderType b
+--   let isDependent = binderName b `isFreeIn` resultTy
+--   arg' <- if isDependent
+--     then checkSigmaDependent (getNameHint b) arg ixTy
+--     else checkSigma (getNameHint b) arg ixTy
+--   arg'' <- zonk arg'
+--   resultTy' <- applySubst (b @> SubstVal arg'') resultTy
+--   rest' <- inferNaryTabAppArgs resultTy' rest
+--   return $ arg'':rest'
 
 checkSigmaDependent :: EmitsBoth o
                     => NameHint -> UExpr i -> CType o -> InfererM i o (CAtom o)
@@ -1556,15 +1567,16 @@ checkSigmaDependent hint e@(WithSrcE ctx _) ty = addSrcContext ctx $
 
 withReducibleEmissions
   :: ( EmitsInf o, SinkableE e, RenameE e, SubstE AtomSubstVal e
-     , HoistableE e, CheaplyReducibleE CoreIR e e)
+     , HoistableE e)
   => String
   -> (forall o' . (EmitsBoth o', DExt o o') => InfererM i o' (e o'))
   -> InfererM i o (e o)
-withReducibleEmissions msg cont = do
-  Abs decls result <- buildDeclsInf cont
-  cheapReduceWithDecls decls result >>= \case
-    Just t -> return t
-    _ -> throw TypeErr msg
+withReducibleEmissions msg cont = undefined
+-- withReducibleEmissions msg cont = do
+--   Abs decls result <- buildDeclsInf cont
+--   cheapReduceWithDecls decls result >>= \case
+--     Just t -> return t
+--     _ -> throw TypeErr msg
 
 -- === sorting case alternatives ===
 
@@ -1621,14 +1633,15 @@ buildSortedCase scrut alts resultTy = do
 
 -- TODO: cache this with the instance def (requires a recursive binding)
 instanceFun :: EnvReader m => InstanceName n -> AppExplicitness -> m n (CAtom n)
-instanceFun instanceName expl = do
-  InstanceDef _ bs _ _ <- lookupInstanceDef instanceName
-  ab <- liftEnvReaderM $ refreshAbs (Abs bs UnitE) \bs' UnitE -> do
-    args <- mapM toAtomVar $ nestToNames bs'
-    let bs'' = fmapNest (\(RolePiBinder _ b) -> b) bs'
-    result <- mkDictAtom $ InstanceDict (sink instanceName) (Var <$> args)
-    return $ Abs bs'' (PairE Pure (AtomicBlock result))
-  Lam <$> coreLamExpr expl ab
+instanceFun instanceName expl = undefined
+-- instanceFun instanceName expl = do
+--   InstanceDef _ bs _ _ <- lookupInstanceDef instanceName
+--   ab <- liftEnvReaderM $ refreshAbs (Abs bs UnitE) \bs' UnitE -> do
+--     args <- mapM toAtomVar $ nestToNames bs'
+--     let bs'' = fmapNest (\(RolePiBinder _ b) -> b) bs'
+--     result <- mkDictAtom $ InstanceDict (sink instanceName) (Var <$> args)
+--     return $ Abs bs'' (PairE Pure (AtomicBlock result))
+--   Lam <$> coreLamExpr expl ab
 
 checkMaybeAnnExpr :: EmitsBoth o
   => NameHint -> Maybe (UType i) -> UExpr i -> InfererM i o (CAtom o)
@@ -1701,29 +1714,30 @@ inferDataCon (sourceName, UDataDefTrail argBs) = do
   return $ DataConDef sourceName argBs'' repTy projIdxs
 
 dataConRepTy :: EmptyAbs (Nest (Binder CoreIR)) n -> (CType n, [[Projection]])
-dataConRepTy (Abs topBs UnitE) = case topBs of
-  Empty -> (UnitTy, [])
-  _ -> go [] [UnwrapNewtype] topBs
-  where
-    go :: [CType l] -> [Projection] -> Nest (Binder CoreIR) l p -> (CType l, [[Projection]])
-    go revAcc projIdxs = \case
-      Empty -> case revAcc of
-        []   -> error "should never happen"
-        [ty] -> (ty, [projIdxs])
-        _    -> ( ProdTy $ reverse revAcc
-                , iota (length revAcc) <&> \i -> ProjectProduct i:projIdxs )
-      Nest b bs -> case hoist b (EmptyAbs bs) of
-        HoistSuccess (Abs bs' UnitE) -> go (binderType b:revAcc) projIdxs bs'
-        HoistFailure _ -> (fullTy, idxs)
-          where
-            accSize = length revAcc
-            (fullTy, depTyIdxs) = case revAcc of
-              [] -> (depTy, [])
-              _  -> (ProdTy $ reverse revAcc ++ [depTy], [ProjectProduct accSize])
-            (tailTy, tailIdxs) = go [] (ProjectProduct 1 : (depTyIdxs ++ projIdxs)) bs
-            idxs = (iota accSize <&> \i -> ProjectProduct i : projIdxs) ++
-                   ((ProjectProduct 0 : (depTyIdxs ++ projIdxs)) : tailIdxs)
-            depTy = DepPairTy $ DepPairType ExplicitDepPair b tailTy
+dataConRepTy = undefined
+-- dataConRepTy (Abs topBs UnitE) = case topBs of
+--   Empty -> (UnitTy, [])
+--   _ -> go [] [UnwrapNewtype] topBs
+--   where
+--     go :: [CType l] -> [Projection] -> Nest (Binder CoreIR) l p -> (CType l, [[Projection]])
+--     go revAcc projIdxs = \case
+--       Empty -> case revAcc of
+--         []   -> error "should never happen"
+--         [ty] -> (ty, [projIdxs])
+--         _    -> ( ProdTy $ reverse revAcc
+--                 , iota (length revAcc) <&> \i -> ProjectProduct i:projIdxs )
+--       Nest b bs -> case hoist b (EmptyAbs bs) of
+--         HoistSuccess (Abs bs' UnitE) -> go (binderType b:revAcc) projIdxs bs'
+--         HoistFailure _ -> (fullTy, idxs)
+--           where
+--             accSize = length revAcc
+--             (fullTy, depTyIdxs) = case revAcc of
+--               [] -> (depTy, [])
+--               _  -> (ProdTy $ reverse revAcc ++ [depTy], [ProjectProduct accSize])
+--             (tailTy, tailIdxs) = go [] (ProjectProduct 1 : (depTyIdxs ++ projIdxs)) bs
+--             idxs = (iota accSize <&> \i -> ProjectProduct i : projIdxs) ++
+--                    ((ProjectProduct 0 : (depTyIdxs ++ projIdxs)) : tailIdxs)
+--             depTy = DepPairTy $ DepPairType ExplicitDepPair b tailTy
 
 inferClassDef
   :: EmitsInf o
@@ -1731,18 +1745,19 @@ inferClassDef
   -> Nest (WithExpl UOptAnnBinder) i i'
   -> [UType i']
   -> InfererM i o (ClassDef o)
-inferClassDef className methodNames paramBs methods = do
-  let paramNames = catMaybes $ nestToList
-        (\(WithExpl expl (UAnnBinder b _ _)) -> case expl of
-             Inferred _ (Synth _) -> Nothing
-             _ -> Just $ Just $ getSourceName b) paramBs
-  ab <- withRoleUBinders paramBs \_ -> do
-     ListE <$> forM methods \m -> do
-       checkUType m >>= \case
-         Pi t -> return t
-         t -> return $ CorePiType ImplicitApp Empty (EffTy Pure t)
-  Abs (PairB bs scs) (ListE mtys) <- identifySuperclasses ab
-  return $ ClassDef className methodNames paramNames bs scs mtys
+inferClassDef = undefined
+-- inferClassDef className methodNames paramBs methods = do
+--   let paramNames = catMaybes $ nestToList
+--         (\(WithExpl expl (UAnnBinder b _ _)) -> case expl of
+--              Inferred _ (Synth _) -> Nothing
+--              _ -> Just $ Just $ getSourceName b) paramBs
+--   ab <- withRoleUBinders paramBs \_ -> do
+--      ListE <$> forM methods \m -> do
+--        checkUType m >>= \case
+--          Pi t -> return t
+--          t -> return $ CorePiType ImplicitApp Empty (EffTy Pure t)
+--   Abs (PairB bs scs) (ListE mtys) <- identifySuperclasses ab
+--   return $ ClassDef className methodNames paramNames bs scs mtys
 
 -- TODO: this is just partitioning the binders. We could write a more general function like this:
 --   partitionBinders :: Nest b n l -> (forall n l. b i i' -> EitherB b1 b2 i i')
@@ -1789,16 +1804,17 @@ withRoleUBinders
   => Nest (WithExpl (UAnnBinder req)) i i'
   -> (forall o'. (EmitsInf o', DExt o o') => [CAtomVar o'] -> InfererM i' o' (e o'))
   -> InfererM i o (Abs RolePiBinders e o)
-withRoleUBinders bs cont = case bs of
-  Empty -> getDistinct >>= \Distinct -> Abs Empty <$> cont []
-  Nest (WithExpl expl (UAnnBinder b ann cs)) rest -> do
-    ann' <- checkAnn (getSourceName b) ann
-    Abs b' (Abs bs' e) <- buildAbsInf (getNameHint b) expl ann' \v -> do
-      Abs ds (Abs bs' e) <- withConstraintBinders cs v $
-        extendSubst (b@>sink (atomVarName v)) $ withRoleUBinders rest \vs -> cont (sink v : vs)
-      return $ Abs (fmapNest (RolePiBinder DictParam) ds >>> bs') e
-    role <- inferRole (binderType b') expl
-    return $ Abs (Nest (RolePiBinder role b') bs') e
+withRoleUBinders _ _ = undefined
+-- withRoleUBinders bs cont = case bs of
+--   Empty -> getDistinct >>= \Distinct -> Abs Empty <$> cont []
+--   Nest (WithExpl expl (UAnnBinder b ann cs)) rest -> do
+--     ann' <- checkAnn (getSourceName b) ann
+--     Abs b' (Abs bs' e) <- buildAbsInf (getNameHint b) expl ann' \v -> do
+--       Abs ds (Abs bs' e) <- withConstraintBinders cs v $
+--         extendSubst (b@>sink (atomVarName v)) $ withRoleUBinders rest \vs -> cont (sink v : vs)
+--       return $ Abs (fmapNest (RolePiBinder DictParam) ds >>> bs') e
+--     role <- inferRole (binderType b') expl
+--     return $ Abs (Nest (RolePiBinder role b') bs') e
 
 inferULam :: EmitsInf o => ULamExpr i -> InfererM i o (CoreLamExpr o)
 inferULam (ULamExpr bs appExpl effs resultTy body) = do
@@ -1822,20 +1838,21 @@ checkImplicitLamRestrictions :: Nest (WithExpl CBinder) o o' -> EffectRow CoreIR
 checkImplicitLamRestrictions _ _ = return () -- TODO
 
 checkUForExpr :: EmitsBoth o => UForExpr i -> TabPiType CoreIR o -> InfererM i o (LamExpr CoreIR o)
-checkUForExpr (UForExpr (UAnnBinder bFor ann cs) body) tabPi@(TabPiType _ bPi _) = do
-  unless (null cs) $ throw TypeErr "`for` binders shouldn't have constraints"
-  let iTy = binderAnn bPi
-  case ann of
-    UNoAnn -> return ()
-    UAnn forAnn -> checkUType forAnn >>= constrainTypesEq iTy
-  Abs b body' <- buildAbsInf (getNameHint bFor) Explicit iTy \i -> do
-    extendRenamer (bFor@>atomVarName i) do
-      TabPiType _ bPi' resultTy <- sinkM tabPi
-      resultTy' <- applyRename (bPi'@>atomVarName i) resultTy
-      buildBlockInf do
-        withBlockDecls body \result ->
-          checkSigma noHint result $ sink resultTy'
-  return $ LamExpr (UnaryNest $ withoutExpl b) body'
+checkUForExpr = undefined
+-- checkUForExpr (UForExpr (UAnnBinder bFor ann cs) body) tabPi@(TabPiType _ bPi _) = do
+--   unless (null cs) $ throw TypeErr "`for` binders shouldn't have constraints"
+--   let iTy = binderAnn bPi
+--   case ann of
+--     UNoAnn -> return ()
+--     UAnn forAnn -> checkUType forAnn >>= constrainTypesEq iTy
+--   Abs b body' <- buildAbsInf (getNameHint bFor) Explicit iTy \i -> do
+--     extendRenamer (bFor@>atomVarName i) do
+--       TabPiType _ bPi' resultTy <- sinkM tabPi
+--       resultTy' <- applyRename (bPi'@>atomVarName i) resultTy
+--       buildBlockInf do
+--         withBlockDecls body \result ->
+--           checkSigma noHint result $ sink resultTy'
+--   return $ LamExpr (UnaryNest $ withoutExpl b) body'
 
 inferUForExpr :: EmitsBoth o => UForExpr i -> InfererM i o (LamExpr CoreIR o)
 inferUForExpr (UForExpr (UAnnBinder bFor ann cs) body) = do
@@ -1848,26 +1865,27 @@ inferUForExpr (UForExpr (UAnnBinder bFor ann cs) body) = do
   return $ LamExpr (UnaryNest $ withoutExpl b) body'
 
 checkULam :: EmitsInf o => ULamExpr i -> CorePiType o -> InfererM i o (CoreLamExpr o)
-checkULam (ULamExpr lamBs lamAppExpl lamEffs lamResultTy body)
-          (CorePiType piAppExpl piBs effTy) = do
-  checkArity piBs (nestToList (const ()) lamBs)
-  when (piAppExpl /= lamAppExpl) $ throw TypeErr $ "Wrong arrow. Expected "
-     ++ pprint piAppExpl ++ " got " ++ pprint lamAppExpl
-  ab <- checkLamBinders piBs lamBs \vs -> do
-    EffTy piEffs' piResultTy' <- applyRename (piBs@@>map atomVarName vs) effTy
-    case lamResultTy of
-      Nothing -> return ()
-      Just t -> checkUType t >>= constrainTypesEq piResultTy'
-    forM_ lamEffs \lamEffs' -> do
-      lamEffs'' <- checkUEffRow lamEffs'
-      constrainEq (Eff piEffs') (Eff lamEffs'')
-    withAllowedEffects piEffs' do
-      body' <- buildBlockInf do
-        piResultTy'' <- sinkM piResultTy'
-        withBlockDecls body \result ->
-          checkSigma noHint result piResultTy''
-      return $ PairE piEffs' body'
-  coreLamExpr piAppExpl ab
+checkULam = undefined
+-- checkULam (ULamExpr lamBs lamAppExpl lamEffs lamResultTy body)
+--           (CorePiType piAppExpl piBs effTy) = do
+--   checkArity piBs (nestToList (const ()) lamBs)
+--   when (piAppExpl /= lamAppExpl) $ throw TypeErr $ "Wrong arrow. Expected "
+--      ++ pprint piAppExpl ++ " got " ++ pprint lamAppExpl
+--   ab <- checkLamBinders piBs lamBs \vs -> do
+--     EffTy piEffs' piResultTy' <- applyRename (piBs@@>map atomVarName vs) effTy
+--     case lamResultTy of
+--       Nothing -> return ()
+--       Just t -> checkUType t >>= constrainTypesEq piResultTy'
+--     forM_ lamEffs \lamEffs' -> do
+--       lamEffs'' <- checkUEffRow lamEffs'
+--       constrainEq (Eff piEffs') (Eff lamEffs'')
+--     withAllowedEffects piEffs' do
+--       body' <- buildBlockInf do
+--         piResultTy'' <- sinkM piResultTy'
+--         withBlockDecls body \result ->
+--           checkSigma noHint result piResultTy''
+--       return $ PairE piEffs' body'
+--   coreLamExpr piAppExpl ab
 
 checkLamBinders
   :: (EmitsInf o, SinkableE e, HoistableE e, SubstE AtomSubstVal e, RenameE e)
@@ -1876,42 +1894,44 @@ checkLamBinders
   -> (forall o'. (EmitsInf o', DExt o o') => [CAtomVar o'] -> InfererM i' o' (e o'))
   -> InfererM i o (Abs (Nest (WithExpl CBinder)) e o)
 checkLamBinders Empty Empty cont = getDistinct >>= \Distinct -> Abs Empty <$> cont []
-checkLamBinders (Nest (WithExpl piExpl (piB:>piAnn)) piBs) lamBs cont = do
-  prependAbs <$> case piExpl of
-    Inferred _ _ ->
-      buildAbsInf (getNameHint piB) piExpl piAnn \v -> do
-        Abs piBs' UnitE <- applyRename (piB@>atomVarName v) $ Abs piBs UnitE
-        checkLamBinders piBs' lamBs \vs ->
-          cont (sink v:vs)
-    Explicit -> case lamBs of
-      Nest (WithExpl Explicit (UAnnBinder lamB ann cs)) lamBsRest -> do
-        case ann of
-          UAnn lamAnn -> checkUType lamAnn >>= constrainTypesEq piAnn
-          UNoAnn -> return ()
-        buildAbsInf (getNameHint lamB) Explicit piAnn \v -> do
-          concatAbs <$> withConstraintBinders cs v do
-            Abs piBs' UnitE <- applyRename (piB@>sink (atomVarName v)) $ Abs piBs UnitE
-            extendRenamer (lamB@>sink (atomVarName v)) $ checkLamBinders piBs' lamBsRest \vs ->
-              cont (sink v:vs)
-      Nest (WithExpl (Inferred _ _) _) _ ->
-        -- TODO(dougalm): I don't think this case is reachable, but if it is
-        -- then we can check for it in `checkULam` and fall back to `inferULam`.
-        error "shouldn't be able to check lambda terms with implicit binders"
-      Empty -> error "zip error"
-checkLamBinders _ _ _ = error "zip error"
+checkLamBinders _ _ _ = undefined
+-- checkLamBinders (Nest (WithExpl piExpl (piB:>piAnn)) piBs) lamBs cont = do
+--   prependAbs <$> case piExpl of
+--     Inferred _ _ ->
+--       buildAbsInf (getNameHint piB) piExpl piAnn \v -> do
+--         Abs piBs' UnitE <- applyRename (piB@>atomVarName v) $ Abs piBs UnitE
+--         checkLamBinders piBs' lamBs \vs ->
+--           cont (sink v:vs)
+--     Explicit -> case lamBs of
+--       Nest (WithExpl Explicit (UAnnBinder lamB ann cs)) lamBsRest -> do
+--         case ann of
+--           UAnn lamAnn -> checkUType lamAnn >>= constrainTypesEq piAnn
+--           UNoAnn -> return ()
+--         buildAbsInf (getNameHint lamB) Explicit piAnn \v -> do
+--           concatAbs <$> withConstraintBinders cs v do
+--             Abs piBs' UnitE <- applyRename (piB@>sink (atomVarName v)) $ Abs piBs UnitE
+--             extendRenamer (lamB@>sink (atomVarName v)) $ checkLamBinders piBs' lamBsRest \vs ->
+--               cont (sink v:vs)
+--       Nest (WithExpl (Inferred _ _) _) _ ->
+--         -- TODO(dougalm): I don't think this case is reachable, but if it is
+--         -- then we can check for it in `checkULam` and fall back to `inferULam`.
+--         error "shouldn't be able to check lambda terms with implicit binders"
+--       Empty -> error "zip error"
+-- checkLamBinders _ _ _ = error "zip error"
 
 checkInstanceParams :: EmitsInf o => RolePiBinders o any -> [UExpr i] -> InfererM i o [CAtom o]
-checkInstanceParams bsTop paramsTop = do
-  checkArity (fmapNest (\(RolePiBinder _ b) -> b) bsTop) paramsTop
-  go bsTop paramsTop
- where
-  go :: EmitsInf o => Nest RolePiBinder o any -> [UExpr i] -> InfererM i o [CAtom o]
-  go Empty [] = return []
-  go (Nest (RolePiBinder _ (WithExpl _ (b:>ty))) bs) (x:xs) = do
-    x' <- checkUParam ty x
-    Abs bs' UnitE <- applySubst (b@>SubstVal x') $ Abs bs UnitE
-    (x':) <$> go bs' xs
-  go _ _ = error "zip error"
+checkInstanceParams bsTop paramsTop = undefined
+-- checkInstanceParams bsTop paramsTop = do
+--   checkArity (fmapNest (\(RolePiBinder _ b) -> b) bsTop) paramsTop
+--   go bsTop paramsTop
+--  where
+--   go :: EmitsInf o => Nest RolePiBinder o any -> [UExpr i] -> InfererM i o [CAtom o]
+--   go Empty [] = return []
+--   go (Nest (RolePiBinder _ (WithExpl _ (b:>ty))) bs) (x:xs) = do
+--     x' <- checkUParam ty x
+--     Abs bs' UnitE <- applySubst (b@>SubstVal x') $ Abs bs UnitE
+--     (x':) <$> go bs' xs
+--   go _ _ = error "zip error"
 
 checkInstanceBody
   :: EmitsInf o => ClassName o -> [CAtom o]
@@ -1930,7 +1950,7 @@ checkInstanceBody className params methods = do
     throw TypeErr $ "Missing method: " ++ pprint (methodNames!!i)
   return $ InstanceBody superclassDicts methods'
 
-superclassDictTys :: Nest CBinder o o' -> InfererM i o [CType o]
+superclassDictTys :: Nest CBinder o o' -> InfererM i o [CTypeBlock o]
 superclassDictTys Empty = return []
 superclassDictTys (Nest b bs) = do
   Abs bs' UnitE <- liftHoistExcept $ hoist b $ Abs bs UnitE
@@ -2008,28 +2028,29 @@ checkCasePat (WithSrcB pos pat) scrutineeTy cont = addSrcContext pos $ case pat 
     constrainTypesEq scrutineeTy $ TypeCon sourceName dataDefName params
     buildAltInf repTy' \arg -> do
       args <- forM idxs \projs -> do
-        ans <- normalizeNaryProj (init projs) (Var arg)
+        ans <- naryProj (init projs) (Var arg)
         emit $ Atom ans
       bindLetPats ps args $ cont
   _ -> throw TypeErr $ "Case patterns must start with a data constructor or variant pattern"
 
 inferParams :: (EmitsBoth o, HasNamesE e, SinkableE e, SubstE AtomSubstVal e)
             => SourceName -> Abs RolePiBinders e o -> InfererM i o (TyConParams o, e o)
-inferParams sourceName (Abs paramBs bodyTop) = do
-  (params, e') <- go (Abs paramBs bodyTop)
-  let expls = nestToList (\(RolePiBinder _ (WithExpl expl _)) -> expl) paramBs
-  return (TyConParams expls params, e')
- where
-  go :: (EmitsBoth o, HasNamesE e, SinkableE e, SubstE AtomSubstVal e)
-     => Abs (Nest RolePiBinder) e o -> InfererM i o ([CAtom o], e o)
-  go (Abs Empty body) = return ([], body)
-  go (Abs (Nest (RolePiBinder _ (WithExpl expl (b:>ty))) bs) body) = do
-    x <- case expl of
-      Explicit -> Var <$> freshInferenceName (TypeInstantiationInfVar sourceName) ty
-      Inferred argName infMech -> getImplicitArg (sourceName, fromMaybe "_" argName) infMech ty
-    rest <- applySubst (b@>SubstVal x) $ Abs bs body
-    (params, body') <- go rest
-    return (x:params, body')
+inferParams sourceName (Abs paramBs bodyTop) = undefined
+-- inferParams sourceName (Abs paramBs bodyTop) = do
+--   (params, e') <- go (Abs paramBs bodyTop)
+--   let expls = nestToList (\(RolePiBinder _ (WithExpl expl _)) -> expl) paramBs
+--   return (TyConParams expls params, e')
+--  where
+--   go :: (EmitsBoth o, HasNamesE e, SinkableE e, SubstE AtomSubstVal e)
+--      => Abs (Nest RolePiBinder) e o -> InfererM i o ([CAtom o], e o)
+--   go (Abs Empty body) = return ([], body)
+--   go (Abs (Nest (RolePiBinder _ (WithExpl expl (b:>ty))) bs) body) = do
+--     x <- case expl of
+--       Explicit -> Var <$> freshInferenceName (TypeInstantiationInfVar sourceName) ty
+--       Inferred argName infMech -> getImplicitArg (sourceName, fromMaybe "_" argName) infMech ty
+--     rest <- applySubst (b@>SubstVal x) $ Abs bs body
+--     (params, body') <- go rest
+--     return (x:params, body')
 
 bindLetPats :: EmitsBoth o
             => Nest UPat i i' -> [CAtomVar o] -> InfererM i' o a -> InfererM i o a
@@ -2046,7 +2067,7 @@ bindLetPat (WithSrcB pos pat) v cont = addSrcContext pos $ case pat of
     _  <- fromProdType n ty
     x <- zonk $ Var v
     xs <- forM (iota n) \i -> do
-      normalizeProj (ProjectProduct i) x >>= emit . Atom
+      proj (ProjectProduct i) x >>= emit . Atom
     bindLetPats ps xs cont
   UPatDepPair (PairB p1 p2) -> do
     let x = Var v
@@ -2068,8 +2089,8 @@ bindLetPat (WithSrcB pos pat) v cont = addSrcContext pos $ case pat of
                                                  ++ " got " ++ show (nestLength ps)
         (params, UnitE) <- inferParams sourceName (Abs paramBs UnitE)
         constrainVarTy v $ TypeCon sourceName dataDefName params
-        x <- cheapNormalize =<< zonk (Var v)
-        xs <- forM idxss \idxs -> normalizeNaryProj idxs x >>= emit . Atom
+        x <- zonk (Var v)
+        xs <- forM idxss \idxs -> naryProj idxs x >>= emit . Atom
         bindLetPats ps xs cont
       _ -> throw TypeErr $ "sum type constructor in can't-fail pattern"
   UPatTable ps -> do
@@ -2103,36 +2124,37 @@ checkUParam k uty@(WithSrcE pos _) = addSrcContext pos $
 
 inferTabCon :: forall i o. EmitsBoth o
   => NameHint -> [UExpr i] -> RequiredTy CType o -> InfererM i o (CAtom o)
-inferTabCon hint xs reqTy = do
-  let n = fromIntegral (length xs) :: Word32
-  let finTy = FinConst n
-  ctx <- srcPosCtx <$> getErrCtx
-  let dataDictHole dTy = Just $ WhenIRE $ DictHole (AlwaysEqual ctx) dTy Full
-  case reqTy of
-    Infer -> do
-      elemTy <- case xs of
-        []    -> freshType
-        (x:_) -> getType <$> inferRho noHint x
-      ixTy <- asIxType finTy
-      let tabTy = ixTy ==> elemTy
-      xs' <- forM xs \x -> checkRho noHint x elemTy
-      dTy <- DictTy <$> dataDictType elemTy
-      liftM Var $ emitHinted hint $ TabCon (dataDictHole dTy) tabTy xs'
-    Check tabTy -> do
-      TabPiType _ b elemTy <- fromTabPiType True tabTy
-      constrainTypesEq (binderType b) finTy
-      xs' <- forM (enumerate xs) \(i, x) -> do
-        let i' = NewtypeCon (FinCon (NatVal n)) (NatVal $ fromIntegral i) :: CAtom o
-        elemTy' <- applySubst (b@>SubstVal i') elemTy
-        checkRho noHint x elemTy'
-      dTy <- case hoist b elemTy of
-        HoistSuccess elemTy' -> DictTy <$> dataDictType elemTy'
-        HoistFailure _ -> ignoreExcept <$> liftEnvReaderT do
-          withFreshBinder noHint finTy \b' ->  do
-            elemTy' <- applyRename (b@>binderName b') elemTy
-            dTy <- DictTy <$> dataDictType elemTy'
-            return $ Pi $ CorePiType ImplicitApp (UnaryNest (WithExpl (Inferred Nothing Unify) b')) (EffTy Pure dTy)
-      liftM Var $ emitHinted hint $ TabCon (dataDictHole dTy) tabTy xs'
+inferTabCon = undefined
+-- inferTabCon hint xs reqTy = do
+--   let n = fromIntegral (length xs) :: Word32
+--   let finTy = FinConst n
+--   ctx <- srcPosCtx <$> getErrCtx
+--   let dataDictHole dTy = Just $ WhenIRE $ DictHole (AlwaysEqual ctx) dTy Full
+--   case reqTy of
+--     Infer -> do
+--       elemTy <- case xs of
+--         []    -> freshType
+--         (x:_) -> getType <$> inferRho noHint x
+--       ixTy <- asIxType finTy
+--       let tabTy = ixTy ==> elemTy
+--       xs' <- forM xs \x -> checkRho noHint x elemTy
+--       dTy <- DictTy <$> dataDictType elemTy
+--       liftM Var $ emitHinted hint $ TabCon (dataDictHole dTy) tabTy xs'
+--     Check tabTy -> do
+--       TabPiType _ b elemTy <- fromTabPiType True tabTy
+--       constrainTypesEq (binderType b) finTy
+--       xs' <- forM (enumerate xs) \(i, x) -> do
+--         let i' = NewtypeCon (FinCon (NatVal n)) (NatVal $ fromIntegral i) :: CAtom o
+--         elemTy' <- applySubst (b@>SubstVal i') elemTy
+--         checkRho noHint x elemTy'
+--       dTy <- case hoist b elemTy of
+--         HoistSuccess elemTy' -> DictTy <$> dataDictType elemTy'
+--         HoistFailure _ -> ignoreExcept <$> liftEnvReaderT do
+--           withFreshBinder noHint finTy \b' ->  do
+--             elemTy' <- applyRename (b@>binderName b') elemTy
+--             dTy <- DictTy <$> dataDictType elemTy'
+--             return $ Pi $ CorePiType ImplicitApp (UnaryNest (WithExpl (Inferred Nothing Unify) b')) (EffTy Pure dTy)
+--       liftM Var $ emitHinted hint $ TabCon (dataDictHole dTy) tabTy xs'
 
 -- Bool flag is just to tweak the reported error message
 fromTabPiType :: EmitsBoth o => Bool -> CType o -> InfererM i o (TabPiType CoreIR o)
@@ -2485,35 +2507,37 @@ unifyEq e1 e2 = guard =<< alphaEq e1 e2
 {-# INLINE unifyEq #-}
 
 instance Unifiable CorePiType where
-  unifyZonked (CorePiType appExpl1 bsTop1 effTy1)
-              (CorePiType appExpl2 bsTop2 effTy2) = do
-    unless (appExpl1 == appExpl2) empty
-    go (Abs bsTop1 effTy1) (Abs bsTop2 effTy2)
-   where
-    go :: EmitsInf n
-       => Abs (Nest (WithExpl CBinder)) (EffTy CoreIR) n
-       -> Abs (Nest (WithExpl CBinder)) (EffTy CoreIR) n
-       -> SolverM n ()
-    go (Abs Empty (EffTy e1 t1)) (Abs Empty (EffTy e2 t2)) = unify t1 t2 >> unify e1 e2
-    go (Abs (Nest (WithExpl expl1 (b1:>t1)) bs1) rest1)
-       (Abs (Nest (WithExpl expl2 (b2:>t2)) bs2) rest2) = do
-      unless (expl1 == expl2) empty
-      unify t1 t2
-      v <- freshSkolemName t1
-      ab1 <- zonk =<< applySubst (b1@>SubstVal (Var v)) (Abs bs1 rest1)
-      ab2 <- zonk =<< applySubst (b2@>SubstVal (Var v)) (Abs bs2 rest2)
-      go ab1 ab2
-    go _ _ = empty
+  unifyZonked = undefined
+  -- unifyZonked (CorePiType appExpl1 bsTop1 effTy1)
+  --             (CorePiType appExpl2 bsTop2 effTy2) = do
+  --   unless (appExpl1 == appExpl2) empty
+  --   go (Abs bsTop1 effTy1) (Abs bsTop2 effTy2)
+  --  where
+  --   go :: EmitsInf n
+  --      => Abs (Nest (WithExpl CBinder)) (EffTy CoreIR) n
+  --      -> Abs (Nest (WithExpl CBinder)) (EffTy CoreIR) n
+  --      -> SolverM n ()
+  --   go (Abs Empty (EffTy e1 t1)) (Abs Empty (EffTy e2 t2)) = unify t1 t2 >> unify e1 e2
+  --   go (Abs (Nest (WithExpl expl1 (b1:>t1)) bs1) rest1)
+  --      (Abs (Nest (WithExpl expl2 (b2:>t2)) bs2) rest2) = do
+  --     unless (expl1 == expl2) empty
+  --     unify t1 t2
+  --     v <- freshSkolemName t1
+  --     ab1 <- zonk =<< applySubst (b1@>SubstVal (Var v)) (Abs bs1 rest1)
+  --     ab2 <- zonk =<< applySubst (b2@>SubstVal (Var v)) (Abs bs2 rest2)
+  --     go ab1 ab2
+  --   go _ _ = empty
 
 unifyTabPiType :: EmitsInf n => TabPiType CoreIR n -> TabPiType CoreIR n -> SolverM n ()
-unifyTabPiType (TabPiType _ b1 ty1) (TabPiType _ b2 ty2) = do
-  let ann1 = binderType b1
-  let ann2 = binderType b2
-  unify ann1 ann2
-  v <- freshSkolemName ann1
-  ty1' <- applySubst (b1@>SubstVal (Var v)) ty1
-  ty2' <- applySubst (b2@>SubstVal (Var v)) ty2
-  unify ty1'  ty2'
+unifyTabPiType (TabPiType _ b1 ty1) (TabPiType _ b2 ty2) = undefined
+-- unifyTabPiType (TabPiType _ b1 ty1) (TabPiType _ b2 ty2) = do
+--   let ann1 = binderType b1
+--   let ann2 = binderType b2
+--   unify ann1 ann2
+--   v <- freshSkolemName ann1
+--   ty1' <- applySubst (b1@>SubstVal (Var v)) ty1
+--   ty2' <- applySubst (b2@>SubstVal (Var v)) ty2
+--   unify ty1'  ty2'
 
 extendSolution :: CAtomName n -> CAtom n -> SolverM n ()
 extendSolution v t =
@@ -2608,38 +2632,40 @@ generalizeDictAndUnify ty dict = do
   zonk dict'
 
 generalizeDictRec :: EmitsInf n => Dict n -> SolverM n (Dict n)
-generalizeDictRec dict = do
-  -- TODO: we should be able to avoid the normalization here . We only need it
-  -- because we sometimes end up with superclass projections. But they shouldn't
-  -- really be allowed to occur in the post-simplification IR.
-  DictCon _ dict' <- cheapNormalize dict
-  mkDictAtom =<< case dict' of
-    InstanceDict instanceName args -> do
-      InstanceDef _ bs _ _ <- lookupInstanceDef instanceName
-      args' <- generalizeInstanceArgs bs args
-      return $ InstanceDict instanceName args'
-    IxFin _ -> IxFin <$> Var <$> freshInferenceName MiscInfVar NatTy
-    InstantiatedGiven _ _ -> notSimplifiedDict
-    SuperclassProj _ _    -> notSimplifiedDict
-    DataData ty           -> DataData <$> TyVar <$> freshInferenceName MiscInfVar ty
-    where notSimplifiedDict = error $ "Not a simplified dict: " ++ pprint dict
+generalizeDictRec dict = undefined
+-- generalizeDictRec dict = do
+--   -- TODO: we should be able to avoid the normalization here . We only need it
+--   -- because we sometimes end up with superclass projections. But they shouldn't
+--   -- really be allowed to occur in the post-simplification IR.
+--   DictCon _ dict' <- dict
+--   mkDictAtom =<< case dict' of
+--     InstanceDict instanceName args -> do
+--       InstanceDef _ bs _ _ <- lookupInstanceDef instanceName
+--       args' <- generalizeInstanceArgs bs args
+--       return $ InstanceDict instanceName args'
+--     IxFin _ -> IxFin <$> Var <$> freshInferenceName MiscInfVar NatTy
+--     InstantiatedGiven _ _ -> notSimplifiedDict
+--     SuperclassProj _ _    -> notSimplifiedDict
+--     DataData ty           -> DataData <$> TyVar <$> freshInferenceName MiscInfVar ty
+--     where notSimplifiedDict = error $ "Not a simplified dict: " ++ pprint dict
 
 generalizeInstanceArgs :: EmitsInf n => RolePiBinders n l -> [CAtom n] -> SolverM n [CAtom n]
-generalizeInstanceArgs Empty [] = return []
-generalizeInstanceArgs (Nest (RolePiBinder role (WithExpl _ (b:>ty))) bs) (arg:args) = do
-  arg' <- case role of
-    -- XXX: for `TypeParam` we can just emit a fresh inference name rather than
-    -- traversing the whole type like we do in `Generalize.hs`. The reason is
-    -- that it's valid to implement `generalizeDict` by synthesizing an entirely
-    -- fresh dictionary, and if we were to do that, we would infer this type
-    -- parameter exactly as we do here, using inference.
-    TypeParam -> Var <$> freshInferenceName MiscInfVar TyKind
-    DictParam -> generalizeDictAndUnify ty arg
-    DataParam -> Var <$> freshInferenceName MiscInfVar ty
-  Abs bs' UnitE <- applySubst (b@>SubstVal arg') (Abs bs UnitE)
-  args' <- generalizeInstanceArgs bs' args
-  return $ arg':args'
-generalizeInstanceArgs _ _ = error "zip error"
+generalizeInstanceArgs = undefined
+-- generalizeInstanceArgs Empty [] = return []
+-- generalizeInstanceArgs (Nest (RolePiBinder role (WithExpl _ (b:>ty))) bs) (arg:args) = do
+--   arg' <- case role of
+--     -- XXX: for `TypeParam` we can just emit a fresh inference name rather than
+--     -- traversing the whole type like we do in `Generalize.hs`. The reason is
+--     -- that it's valid to implement `generalizeDict` by synthesizing an entirely
+--     -- fresh dictionary, and if we were to do that, we would infer this type
+--     -- parameter exactly as we do here, using inference.
+--     TypeParam -> Var <$> freshInferenceName MiscInfVar TyKind
+--     DictParam -> generalizeDictAndUnify ty arg
+--     DataParam -> Var <$> freshInferenceName MiscInfVar ty
+--   Abs bs' UnitE <- applySubst (b@>SubstVal arg') (Abs bs UnitE)
+--   args' <- generalizeInstanceArgs bs' args
+--   return $ arg':args'
+-- generalizeInstanceArgs _ _ = error "zip error"
 
 synthInstanceDefAndAddSynthCandidate
   :: (Mut n, TopBuilder m, EnvReader m,  Fallible1 m) => InstanceDef n -> m n (InstanceName n)
@@ -2705,18 +2731,19 @@ synthInstanceDef (InstanceDef className bs params body) = do
            return $ InstanceDef className bs' params' $ InstanceBody superclasses methods'
 
 -- main entrypoint to dictionary synthesizer
-trySynthTerm :: (Fallible1 m, EnvReader m) => CType n -> RequiredMethodAccess -> m n (SynthAtom n)
-trySynthTerm ty reqMethodAccess = do
-  hasInferenceVars ty >>= \case
-    True -> throw TypeErr "Can't synthesize a dictionary for a type with inference vars"
-    False -> do
-      synthTy <- liftExcept $ typeAsSynthType ty
-      solutions <- liftSyntherM $ synthTerm synthTy reqMethodAccess
-      case solutions of
-        [] -> throw TypeErr $ "Couldn't synthesize a class dictionary for: " ++ pprint ty
-        [d] -> cheapNormalize d -- normalize to reduce code size
-        _ -> throw TypeErr $ "Multiple candidate class dictionaries for: " ++ pprint ty
-{-# SCC trySynthTerm #-}
+trySynthTerm :: (Fallible1 m, EnvReader m) => CTypeBlock n -> RequiredMethodAccess -> m n (SynthAtom n)
+trySynthTerm ty reqMethodAccess = undefined
+-- trySynthTerm ty reqMethodAccess = do
+--   hasInferenceVars ty >>= \case
+--     True -> throw TypeErr "Can't synthesize a dictionary for a type with inference vars"
+--     False -> do
+--       synthTy <- liftExcept $ typeAsSynthType ty
+--       solutions <- liftSyntherM $ synthTerm synthTy reqMethodAccess
+--       case solutions of
+--         [] -> throw TypeErr $ "Couldn't synthesize a class dictionary for: " ++ pprint ty
+--         [d] -> return d -- normalize to reduce code size
+--         _ -> throw TypeErr $ "Multiple candidate class dictionaries for: " ++ pprint ty
+-- {-# SCC trySynthTerm #-}
 
 type SynthAtom = CAtom
 type SynthPiType = Abs (Nest (WithExpl CBinder)) DictType
@@ -2766,15 +2793,16 @@ extendGivens newGivens cont = do
 {-# INLINE extendGivens #-}
 
 getSynthType :: SynthAtom n -> SynthType n
-getSynthType x = ignoreExcept $ typeAsSynthType (getType x)
+getSynthType x = ignoreExcept $ typeAsSynthType (WithoutDecls $ getType x)
 {-# INLINE getSynthType #-}
 
-typeAsSynthType :: CType n -> Except (SynthType n)
-typeAsSynthType = \case
-  DictTy dictTy -> return $ SynthDictType dictTy
-  Pi (CorePiType ImplicitApp bs (EffTy Pure (DictTy d))) -> return $ SynthPiType (Abs bs d)
-  ty -> Failure $ Errs [Err TypeErr mempty $ "Can't synthesize terms of type: " ++ pprint ty]
-{-# SCC typeAsSynthType #-}
+typeAsSynthType :: CTypeBlock n -> Except (SynthType n)
+typeAsSynthType = undefined
+-- typeAsSynthType = \case
+--   DictTy dictTy -> return $ SynthDictType dictTy
+--   Pi (CorePiType ImplicitApp bs (EffTy Pure (DictTy d))) -> return $ SynthPiType (Abs bs d)
+--   ty -> Failure $ Errs [Err TypeErr mempty $ "Can't synthesize terms of type: " ++ pprint ty]
+-- {-# SCC typeAsSynthType #-}
 
 getSuperclassClosure :: EnvReader m => Givens n -> [SynthAtom n] -> m n (Givens n)
 getSuperclassClosure givens newGivens = do
@@ -2808,13 +2836,14 @@ getSuperclassClosurePure env givens newGivens =
       modify \(Givens m) -> Givens $ HM.insert (EKey ty) x m
 
     getDirectSuperclasses :: SynthAtom n -> EnvReaderT (State (Givens n)) n [SynthAtom n]
-    getDirectSuperclasses synthExpr = do
-      synthTy <- return $ getSynthType synthExpr
-      superclasses <- case synthTy of
-        SynthPiType _ -> return []
-        SynthDictType dTy -> getSuperclassTys dTy
-      forM (enumerate superclasses) \(i, ty) -> do
-        return $ DictCon ty $ SuperclassProj synthExpr i
+    getDirectSuperclasses synthExpr = undefined
+    -- getDirectSuperclasses synthExpr = do
+    --   synthTy <- return $ getSynthType synthExpr
+    --   superclasses <- case synthTy of
+    --     SynthPiType _ -> return []
+    --     SynthDictType dTy -> getSuperclassTys dTy
+    --   forM (enumerate superclasses) \(i, ty) -> do
+    --     return $ DictCon ty $ SuperclassProj synthExpr i
 
 synthTerm :: SynthType n -> RequiredMethodAccess -> SyntherM n (SynthAtom n)
 synthTerm targetTy reqMethodAccess = confuseGHC >>= \_ -> case targetTy of
@@ -2843,26 +2872,27 @@ withGivenBinders
   :: (SinkableE e, RenameE e) => Abs (Nest (WithExpl CBinder)) e n
   -> (forall l. DExt n l => Nest (WithExpl CBinder) n l -> e l -> SyntherM l a)
   -> SyntherM n a
-withGivenBinders (Abs bsTop e) contTop =
-  runSubstReaderT idSubst $ go bsTop \bsTop' -> do
-    e' <- renameM e
-    liftSubstReaderT $ contTop bsTop' e'
- where
-   go :: Nest (WithExpl CBinder) i i'
-      -> (forall o'. DExt o o' => Nest (WithExpl CBinder) o o' -> SubstReaderT Name SyntherM i' o' a)
-      -> SubstReaderT Name SyntherM i o a
-   go bs cont = case bs of
-     Empty -> getDistinct >>= \Distinct -> cont Empty
-     Nest (WithExpl expl b) rest -> do
-       argTy <- renameM $ binderType b
-       withFreshBinder (getNameHint b) argTy \b' -> do
-         givens <- case expl of
-           Inferred _ (Synth _) -> return [Var $ binderVar b']
-           _ -> return []
-         s <- getSubst
-         liftSubstReaderT $ extendGivens givens $
-           runSubstReaderT (s <>> b@>binderName b') $
-             go rest \rest' -> cont (Nest (WithExpl expl b') rest')
+withGivenBinders (Abs bsTop e) contTop = undefined
+-- withGivenBinders (Abs bsTop e) contTop =
+--   runSubstReaderT idSubst $ go bsTop \bsTop' -> do
+--     e' <- renameM e
+--     liftSubstReaderT $ contTop bsTop' e'
+--  where
+--    go :: Nest (WithExpl CBinder) i i'
+--       -> (forall o'. DExt o o' => Nest (WithExpl CBinder) o o' -> SubstReaderT Name SyntherM i' o' a)
+--       -> SubstReaderT Name SyntherM i o a
+--    go bs cont = case bs of
+--      Empty -> getDistinct >>= \Distinct -> cont Empty
+--      Nest (WithExpl expl b) rest -> do
+--        argTy <- renameM $ binderType b
+--        withFreshBinder (getNameHint b) argTy \b' -> do
+--          givens <- case expl of
+--            Inferred _ (Synth _) -> return [Var $ binderVar b']
+--            _ -> return []
+--          s <- getSubst
+--          liftSubstReaderT $ extendGivens givens $
+--            runSubstReaderT (s <>> b@>binderName b') $
+--              go rest \rest' -> cont (Nest (WithExpl expl b') rest')
 
 isMethodAccessAllowedBy :: EnvReader m =>  RequiredMethodAccess -> InstanceName n -> m n Bool
 isMethodAccessAllowedBy access instanceName = do
@@ -2887,66 +2917,69 @@ synthDictFromGiven targetTy = do
         return $ DictCon (DictTy targetTy) $ InstantiatedGiven given args
 
 synthDictFromInstance :: DictType n -> SyntherM n (SynthAtom n)
-synthDictFromInstance targetTy@(DictType _ targetClass _) = do
-  instances <- getInstanceDicts targetClass
-  asum $ instances <&> \candidate -> do
-    CorePiType _ bs (EffTy _ (DictTy candidateTy)) <- lookupInstanceTy candidate
-    args <- instantiateSynthArgs targetTy $ Abs bs candidateTy
-    return $ DictCon (DictTy targetTy) $ InstanceDict candidate args
+synthDictFromInstance targetTy@(DictType _ targetClass _) = undefined
+-- synthDictFromInstance targetTy@(DictType _ targetClass _) = do
+--   instances <- getInstanceDicts targetClass
+--   asum $ instances <&> \candidate -> do
+--     CorePiType _ bs (EffTy _ (DictTy candidateTy)) <- lookupInstanceTy candidate
+--     args <- instantiateSynthArgs targetTy $ Abs bs candidateTy
+--     return $ DictCon (DictTy targetTy) $ InstanceDict candidate args
 
 instantiateSynthArgs :: DictType n -> SynthPiType n -> SyntherM n [CAtom n]
-instantiateSynthArgs targetTop (Abs bsTop resultTyTop) = do
-  ListE args <- (liftExceptAlt =<<) $ liftSolverM $ solveLocal do
-    args <- runSubstReaderT idSubst $ go (sink targetTop) (sink $ Abs bsTop resultTyTop)
-    zonk $ ListE args
-  forM args \case
-    DictHole _ argTy req -> liftExceptAlt (typeAsSynthType argTy) >>= flip synthTerm req
-    arg -> return arg
- where
-   go :: EmitsInf o
-      => DictType o -> Abs (Nest (WithExpl CBinder)) DictType i
-      -> SubstReaderT AtomSubstVal SolverM i o [CAtom o]
-   go target (Abs bs proposed) = case bs of
-     Empty -> do
-       proposed' <- substM proposed
-       liftSubstReaderT $ unify target proposed'
-       return []
-     Nest (WithExpl expl b) rest -> do
-       argTy <- substM $ binderType b
-       arg <- liftSubstReaderT case expl of
-         Explicit -> error "instances shouldn't have explicit args"
-         Inferred _ Unify -> Var <$> freshInferenceName MiscInfVar argTy
-         Inferred _ (Synth req) -> return $ DictHole (AlwaysEqual Nothing) argTy req
-       liftM (arg:) $ extendSubst (b@>SubstVal arg) $ go target (Abs rest proposed)
+instantiateSynthArgs targetTop (Abs bsTop resultTyTop) = undefined
+-- instantiateSynthArgs targetTop (Abs bsTop resultTyTop) = do
+--   ListE args <- (liftExceptAlt =<<) $ liftSolverM $ solveLocal do
+--     args <- runSubstReaderT idSubst $ go (sink targetTop) (sink $ Abs bsTop resultTyTop)
+--     zonk $ ListE args
+--   forM args \case
+--     DictHole _ argTy req -> liftExceptAlt (typeAsSynthType argTy) >>= flip synthTerm req
+--     arg -> return arg
+--  where
+--    go :: EmitsInf o
+--       => DictType o -> Abs (Nest (WithExpl CBinder)) DictType i
+--       -> SubstReaderT AtomSubstVal SolverM i o [CAtom o]
+--    go target (Abs bs proposed) = case bs of
+--      Empty -> do
+--        proposed' <- substM proposed
+--        liftSubstReaderT $ unify target proposed'
+--        return []
+--      Nest (WithExpl expl b) rest -> do
+--        argTy <- substM $ binderType b
+--        arg <- liftSubstReaderT case expl of
+--          Explicit -> error "instances shouldn't have explicit args"
+--          Inferred _ Unify -> Var <$> freshInferenceName MiscInfVar argTy
+--          Inferred _ (Synth req) -> return $ DictHole (AlwaysEqual Nothing) argTy req
+--        liftM (arg:) $ extendSubst (b@>SubstVal arg) $ go target (Abs rest proposed)
 
 synthDictForData :: forall n. DictType n -> SyntherM n (SynthAtom n)
-synthDictForData dictTy@(DictType "Data" dName [Type ty]) = case ty of
-  -- TODO Deduplicate vs CheckType.checkDataLike
-  -- The "Var" case is different
-  TyVar _ -> synthDictFromGiven dictTy
-  TabPi (TabPiType _ b eltTy) -> recurBinder (Abs b eltTy) >> success
-  DepPairTy (DepPairType _ b@(_:>l) r) -> do
-    recur l >> recurBinder (Abs b r) >> success
-  NewtypeTyCon nt -> do
-    (_, ty') <- unwrapNewtypeType nt
-    recur ty' >> success
-  TC con -> case con of
-    BaseType _       -> success
-    ProdType as      -> mapM_ recur as >> success
-    SumType  cs      -> mapM_ recur cs >> success
-    RefType _ _      -> success
-    HeapType         -> success
-    _ -> notData
-  _   -> notData
-  where
-    recur ty' = synthDictForData $ DictType "Data" dName [Type ty']
-    recurBinder :: (RenameB b, BindsEnv b) => Abs b CType n -> SyntherM n (SynthAtom n)
-    recurBinder bAbs = refreshAbs bAbs \b' ty'' -> do
-      ans <- synthDictForData $ DictType "Data" (sink dName) [Type ty'']
-      return $ ignoreHoistFailure $ hoist b' ans
-    notData = empty
-    success = return $ DictCon (DictTy dictTy) $ DataData ty
-synthDictForData dictTy = error $ "Malformed Data dictTy " ++ pprint dictTy
+synthDictForData dictTy@(DictType "Data" dName [Type ty]) = undefined
+-- synthDictForData dictTy@(DictType "Data" dName [Type ty]) = case ty of
+--   -- TODO Deduplicate vs CheckType.checkDataLike
+--   -- The "Var" case is different
+--   TyVar _ -> synthDictFromGiven dictTy
+--   TabPi (TabPiType _ b eltTy) -> recurBinder (Abs b eltTy) >> success
+--   DepPairTy (DepPairType _ b@(_:>l) r) -> do
+--     recur l >> recurBinder (Abs b r) >> success
+--   NewtypeTyCon nt -> do
+--     (_, ty') <- unwrapNewtypeType nt
+--     recur ty' >> success
+--   TC con -> case con of
+--     BaseType _       -> success
+--     ProdType as      -> mapM_ recur as >> success
+--     SumType  cs      -> mapM_ recur cs >> success
+--     RefType _ _      -> success
+--     HeapType         -> success
+--     _ -> notData
+--   _   -> notData
+--   where
+--     recur ty' = synthDictForData $ DictType "Data" dName [Type ty']
+--     recurBinder :: (RenameB b, BindsEnv b) => Abs b CType n -> SyntherM n (SynthAtom n)
+--     recurBinder bAbs = refreshAbs bAbs \b' ty'' -> do
+--       ans <- synthDictForData $ DictType "Data" (sink dName) [Type ty'']
+--       return $ ignoreHoistFailure $ hoist b' ans
+--     notData = empty
+--     success = return $ DictCon (DictTy dictTy) $ DataData ty
+-- synthDictForData dictTy = error $ "Malformed Data dictTy " ++ pprint dictTy
 
 instance GenericE Givens where
   type RepE Givens = HashMapE (EKey SynthType) SynthAtom
@@ -2991,33 +3024,33 @@ class DictSynthTraversable (e::E) where
   dsTraverse :: e i -> DictSynthTraverserM i o (e o)
 
 instance DictSynthTraversable CAtom where
-  dsTraverse atom = case atom of
-    DictHole (AlwaysEqual ctx) ty access -> do
-      ty' <- cheapNormalize =<< dsTraverse ty
-      ans <- liftEnvReaderT $ addSrcContext ctx $ trySynthTerm ty' access
-      case ans of
-        Failure errs -> put (LiftE errs) >> renameM atom
-        Success d    -> return d
-    Lam (CoreLamExpr piTy@(CorePiType _ bsPi _) (LamExpr bsLam body)) -> do
-      Pi piTy' <- dsTraverse $ Pi piTy
-      let (expls, _) = unzipExpls bsPi
-      lam' <- dsTraverseExplBinders (zipExpls expls bsLam) \bsLamExpl' -> do
-        let (_, bsLam') = unzipExpls bsLamExpl'
-        LamExpr bsLam' <$> dsTraverse body
-      return $ Lam $ CoreLamExpr piTy' lam'
-    Var _          -> renameM atom
-    SimpInCore _   -> renameM atom
-    ProjectElt _ _ _ -> renameM atom
-    _ -> visitAtomPartial atom
+  dsTraverse atom = undefined
+  -- dsTraverse atom = case atom of
+  --   DictHole (AlwaysEqual ctx) ty access -> do
+  --     ty' <- dsTraverse ty
+  --     ans <- liftEnvReaderT $ addSrcContext ctx $ trySynthTerm ty' access
+  --     case ans of
+  --       Failure errs -> put (LiftE errs) >> renameM atom
+  --       Success d    -> return d
+  --   Lam (CoreLamExpr piTy@(CorePiType _ bsPi _) (LamExpr bsLam body)) -> do
+  --     Pi piTy' <- dsTraverse $ Pi piTy
+  --     let (expls, _) = unzipExpls bsPi
+  --     lam' <- dsTraverseExplBinders (zipExpls expls bsLam) \bsLamExpl' -> do
+  --       let (_, bsLam') = unzipExpls bsLamExpl'
+  --       LamExpr bsLam' <$> dsTraverse body
+  --     return $ Lam $ CoreLamExpr piTy' lam'
+  --   Var _          -> renameM atom
+  --   SimpInCore _   -> renameM atom
+  --   _ -> visitAtomPartial atom
 
 instance DictSynthTraversable CType where
-  dsTraverse ty = case ty of
-    Pi (CorePiType appExpl bs (EffTy effs resultTy)) -> Pi <$>
-      dsTraverseExplBinders bs \bs' -> do
-        CorePiType appExpl bs' <$> (EffTy <$> renameM effs <*> dsTraverse resultTy)
-    TyVar _          -> renameM ty
-    ProjectEltTy _ _ _ -> renameM ty
-    _ -> visitTypePartial ty
+  dsTraverse ty = undefined
+  -- dsTraverse ty = case ty of
+  --   Pi (CorePiType appExpl bs (EffTy effs resultTy)) -> Pi <$>
+  --     dsTraverseExplBinders bs \bs' -> do
+  --       CorePiType appExpl bs' <$> (EffTy <$> renameM effs <*> dsTraverse resultTy)
+  --   TyVar _          -> renameM ty
+  --   _ -> visitTypePartial ty
 
 instance DictSynthTraversable DataConDefs where dsTraverse = visitGeneric
 instance DictSynthTraversable (Block CoreIR) where
@@ -3028,12 +3061,12 @@ dsTraverseExplBinders
   -> (forall o'. DExt o o' => Nest (WithExpl CBinder) o o' -> DictSynthTraverserM i' o' a)
   -> DictSynthTraverserM i o a
 dsTraverseExplBinders Empty cont = getDistinct >>= \Distinct -> cont Empty
-dsTraverseExplBinders (Nest (WithExpl expl b) bs) cont = do
-  ty <- dsTraverse $ binderType b
-  withFreshBinder (getNameHint b) ty \b' -> do
-    let v = binderName b'
-    extendSynthCandidatesDict expl v $ extendRenamer (b@>v) do
-      dsTraverseExplBinders bs \bs' -> cont $ Nest (WithExpl expl b') bs'
+-- dsTraverseExplBinders (Nest (WithExpl expl b) bs) cont = do
+--   ty <- dsTraverse $ binderType b
+--   withFreshBinder (getNameHint b) ty \b' -> do
+--     let v = binderName b'
+--     extendSynthCandidatesDict expl v $ extendRenamer (b@>v) do
+--       dsTraverseExplBinders bs \bs' -> cont $ Nest (WithExpl expl b') bs'
 
 extendSynthCandidatesDict :: Explicitness -> CAtomName n -> DictSynthTraverserM i n a -> DictSynthTraverserM i n a
 extendSynthCandidatesDict c v cont = DictSynthTraverserM do
@@ -3077,20 +3110,22 @@ buildTabPiInf
   => NameHint -> IxType CoreIR n
   -> (forall l. (EmitsInf l, Ext n l) => CAtomVar l -> InfererM i l (CType l))
   -> InfererM i n (TabPiType CoreIR n)
-buildTabPiInf hint (IxType t d) body = do
-  Abs (WithExpl _ (b:>_)) resultTy <-
-    buildAbsInf hint Explicit t \v ->
-      withoutEffects $ body v
-  return $ TabPiType d (b:>t) resultTy
+buildTabPiInf hint (IxType t d) body = undefined
+-- buildTabPiInf hint (IxType t d) body = do
+--   Abs (WithExpl _ (b:>_)) resultTy <-
+--     buildAbsInf hint Explicit t \v ->
+--       withoutEffects $ body v
+--   return $ TabPiType d (b:>t) resultTy
 
 buildDepPairTyInf
   :: EmitsInf n
   => NameHint -> DepPairExplicitness -> CType n
   -> (forall l. (EmitsInf l, Ext n l) => CAtomVar l -> InfererM i l (CType l))
   -> InfererM i n (DepPairType CoreIR n)
-buildDepPairTyInf hint expl ty body = do
-  Abs b resultTy <- buildAbsInf hint Explicit ty body
-  return $ DepPairType expl (withoutExpl b) resultTy
+buildDepPairTyInf hint expl ty body = undefined
+-- buildDepPairTyInf hint expl ty body = do
+--   Abs b resultTy <- buildAbsInf hint Explicit ty body
+--   return $ DepPairType expl (withoutExpl b) resultTy
 
 buildAltInf
   :: EmitsInf n
